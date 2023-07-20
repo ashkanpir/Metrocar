@@ -1,0 +1,720 @@
+/*
+-- Funnel Steps --
+This code calculates various metrics for a funnel consisting of the following steps:
+
+Step 1: app_downloads - Total number of app downloads
+Step 2: signups - Total number of users signed up
+Step 3: ride_requests - Total number of ride requests made by users
+Step 4: completed_rides - Total number of rides completed
+Step 5: reviews - Total number of ride reviews
+
+The code then calculates the previous value as a percentage change from the previous step.
+*/
+
+-- #region Funnel Steps
+-- Table: funnel_stages
+-- ------------------------------------------------
+-- | funnel_step | funnel_name      | value   | previous_value |
+-- ------------------------------------------------
+-- | 1           | app_downloads    | 23608   | %              |
+-- | 2           | signups          | 17623   | 74.71%         |
+-- | 3           | ride_requests    | 12406   | 70.43%         |
+-- | 4           | completed_rides  | 223652  | 1803.22%       |
+-- | 5           | reviews          | 156211  | 69.83%         |
+-- ------------------------------------------------
+WITH user_ride_status AS (
+  SELECT user_id
+  FROM ride_requests
+  GROUP BY user_id
+),
+totals AS (
+  SELECT
+    COUNT(*) AS total_users_signed_up,
+    COUNT(DISTINCT urs.user_id) AS total_users_ride_requested
+  FROM signups s
+  LEFT JOIN user_ride_status urs ON s.user_id = urs.user_id
+),
+downloads AS (
+  SELECT COUNT(*) AS total_downloads FROM app_downloads
+),
+completed_rides AS (
+  SELECT COUNT(*) AS total_completed_rides
+  FROM ride_requests
+  WHERE pickup_ts IS NOT NULL
+),
+ride_reviews AS (
+  SELECT COUNT(*) AS total_reviews
+  FROM reviews
+),
+funnel_stages AS (
+  SELECT
+    1 AS funnel_step,
+    'app_downloads' AS funnel_name,
+    total_downloads AS value
+  FROM downloads
+  UNION
+  SELECT
+    2 AS funnel_step,
+    'signups' AS funnel_name,
+    total_users_signed_up AS value
+  FROM totals
+  UNION
+  SELECT
+    3 AS funnel_step,
+    'ride_requests' AS funnel_name,
+    total_users_ride_requested AS value
+  FROM totals
+  UNION
+  SELECT
+    4 AS funnel_step,
+    'completed_rides' AS funnel_name,
+    total_completed_rides AS value
+  FROM completed_rides
+  UNION
+  SELECT
+    5 AS funnel_step,
+    'reviews' AS funnel_name,
+    total_reviews AS value
+  FROM ride_reviews
+)
+SELECT *,
+  CONCAT((CAST(value::float / LAG(value) OVER (ORDER BY funnel_step) AS numeric(5, 2)) * 100), '%') AS previous_value
+FROM funnel_stages
+ORDER BY funnel_step;
+-- #endregion
+
+/*
+-- Funnel Stages --
+This code calculates various metrics for different funnel stages based on downloads, 
+signups, ride requests, payments, reviews, etc. This will produce a table with 37265 rows, which gives us all we need to visualize
+the funnel. Otherwise, all 5 tables need to be imported and correctly blended for accurate visualization.
+The ouput will look like this:
+-- Sample Result --
+The following is a sample result for the funnel stages:
+
+| funnel_step | funnel_name | platform | age_range | download_dt  | user_count | unique_users | ride_count | fare |
+|-------------|-------------|----------|-----------|--------------|------------|--------------|------------|------|
+| 0           | download    | android  | 18-24     | 2021-01-02   | 62         | 2            | 0          | 0    |
+| 0           | download    | android  | 18-24     | 2021-01-04   | 45         | 3            | 0          | 0    |
+| 0           | download    | android  | 18-24     | 2021-01-05   | 50         | 1            | 0          | 0    |
+| 0           | download    | android  | 18-24     | 2021-01-06   | 50         | 1            | 0          | 0    |
+| 0           | download    | android  | 18-24     | 2021-01-07   | 1          | 1            | 0          | 0    |
+
+*/
+
+-- #region Funnel Stages
+WITH downloads AS (
+  SELECT
+    app_download_key,
+    platform,
+    DATE(download_ts) AS download_dt
+  FROM app_downloads
+),
+signup AS (
+  SELECT
+    session_id, 
+    user_id,
+    DATE(signup_ts),
+    age_range
+  FROM signups
+),
+ride_info AS (
+  SELECT
+    ride_id,
+    user_id,
+    driver_id,
+    dropoff_ts,
+    cancel_ts,
+    request_ts,
+    accept_ts
+  FROM ride_requests
+),
+payment AS (
+  SELECT
+    ride_id,
+    charge_status,
+    purchase_amount_usd
+  FROM transactions
+),
+review AS (
+  SELECT
+    ride_id,
+    review_id,
+    user_id,
+    rating,
+    review
+  FROM reviews
+),
+funnel_stages AS (
+  SELECT
+    0 AS funnel_step,
+    'download' AS funnel_name,
+    platform,
+    age_range,
+    download_dt,
+    COUNT(*) AS user_count,
+    COUNT(DISTINCT app_download_key) AS unique_users,
+    0 AS ride_count,
+    0 AS fare
+  FROM downloads
+  LEFT JOIN signup ON signup.session_id = downloads.app_download_key
+  LEFT JOIN ride_info ON signup.user_id = ride_info.user_id
+  LEFT JOIN payment ON ride_info.ride_id = payment.ride_id
+  GROUP BY platform, age_range, download_dt
+
+  UNION ALL
+
+  SELECT
+    1 AS funnel_step,
+    'signup' AS funnel_name,
+    platform,
+    age_range,
+    download_dt,
+    COUNT(DISTINCT signup.user_id) AS user_count,
+    COUNT(DISTINCT signup.session_id) AS unique_users,
+    0 AS ride_count,
+    0 AS fare
+  FROM downloads
+  LEFT JOIN signup ON downloads.app_download_key = signup.session_id
+  LEFT JOIN ride_info ON signup.user_id = ride_info.user_id
+  LEFT JOIN payment ON ride_info.ride_id = payment.ride_id
+  GROUP BY platform, age_range, download_dt
+
+  UNION ALL
+
+  SELECT
+    2 AS funnel_step,
+    'ride_requested' AS funnel_name,
+    platform,
+    age_range,
+    download_dt,
+    COUNT(CASE WHEN request_ts IS NOT NULL THEN signup.user_id ELSE NULL END) AS user_count,
+    COUNT(DISTINCT CASE WHEN request_ts IS NOT NULL THEN signup.user_id ELSE NULL END) AS unique_users,
+    SUM(CASE WHEN ride_info.request_ts IS NOT NULL THEN 1 ELSE 0 END) AS ride_count,
+    0 AS fare
+  FROM downloads
+  LEFT JOIN signup ON downloads.app_download_key = signup.session_id
+  LEFT JOIN ride_info ON signup.user_id = ride_info.user_id
+  LEFT JOIN payment ON ride_info.ride_id = payment.ride_id
+  GROUP BY platform, age_range, download_dt
+
+  UNION ALL
+
+  SELECT
+    3 AS funnel_step,
+    'ride_accepted' AS funnel_name,
+    platform,
+    age_range,
+    download_dt,
+    COUNT(CASE WHEN accept_ts IS NOT NULL THEN ride_info.user_id ELSE NULL END) AS user_count,
+    COUNT(DISTINCT CASE WHEN accept_ts IS NOT NULL THEN ride_info.user_id ELSE NULL END) AS unique_users,
+    SUM(CASE WHEN ride_info.accept_ts IS NOT NULL THEN 1 ELSE 0 END) AS ride_count,
+    0 AS fare
+  FROM downloads
+  LEFT JOIN signup ON downloads.app_download_key = signup.session_id
+  LEFT JOIN ride_info ON signup.user_id = ride_info.user_id
+  LEFT JOIN payment ON ride_info.ride_id = payment.ride_id
+  GROUP BY platform, age_range, download_dt
+
+  UNION ALL
+
+  SELECT
+    4 AS funnel_step,
+    'ride_completed' AS funnel_name,
+    platform,
+    age_range,
+    download_dt,
+    COUNT(CASE WHEN dropoff_ts IS NOT NULL THEN ride_info.user_id ELSE NULL END) AS user_count,
+    COUNT(DISTINCT CASE WHEN dropoff_ts IS NOT NULL THEN ride_info.user_id ELSE NULL END) AS unique_users,
+    SUM(CASE WHEN ride_info.dropoff_ts IS NOT NULL THEN 1 ELSE 0 END) AS ride_count,
+    0 AS fare
+  FROM downloads
+  LEFT JOIN signup ON downloads.app_download_key = signup.session_id
+  LEFT JOIN ride_info ON signup.user_id = ride_info.user_id
+  LEFT JOIN payment ON ride_info.ride_id = payment.ride_id
+  GROUP BY platform, age_range, download_dt
+
+  UNION ALL
+
+  SELECT
+    5 AS funnel_step,
+    'payment' AS funnel_name,
+    platform,
+    age_range,
+    download_dt,
+    COUNT(CASE WHEN purchase_amount_usd IS NOT NULL THEN ride_info.user_id ELSE NULL END) AS user_count,
+    COUNT(DISTINCT CASE WHEN purchase_amount_usd IS NOT NULL THEN ride_info.user_id ELSE NULL END) AS unique_users,
+    SUM(CASE WHEN payment.charge_status = 'Approved' THEN 1 ELSE 0 END) AS ride_count,
+    SUM(CASE WHEN payment.charge_status = 'Approved' THEN purchase_amount_usd ELSE 0 END) AS fare
+  FROM downloads
+  LEFT JOIN signup ON downloads.app_download_key = signup.session_id
+  LEFT JOIN ride_info ON signup.user_id = ride_info.user_id
+  LEFT JOIN payment ON ride_info.ride_id = payment.ride_id
+  GROUP BY platform, age_range, download_dt, payment.charge_status -- Include charge_status in the grouping
+
+  UNION ALL
+
+  SELECT
+    6 AS funnel_step,
+    'review' AS funnel_name,
+    platform,
+    age_range,
+    download_dt,
+    COUNT(CASE WHEN review IS NOT NULL THEN review.user_id ELSE NULL END) AS user_count,
+    COUNT(DISTINCT CASE WHEN review IS NOT NULL THEN review.user_id ELSE NULL END) AS unique_users,
+    SUM(CASE WHEN ride_info.dropoff_ts IS NOT NULL THEN 1 ELSE 0 END) AS ride_count,
+    0 AS fare
+  FROM downloads
+  LEFT JOIN signup ON downloads.app_download_key = signup.session_id
+  LEFT JOIN ride_info ON signup.user_id = ride_info.user_id
+  LEFT JOIN review ON review.ride_id = ride_info.ride_id
+  LEFT JOIN payment ON ride_info.ride_id = payment.ride_id
+  GROUP BY platform, age_range, download_dt
+)
+SELECT * FROM funnel_stages
+ORDER BY funnel_step, platform, age_range, download_dt;
+-- #endregion
+
+/*
+-- Funnel by Age Range --
+This code calculates various metrics for different funnel stages based on age range.
+*/
+
+-- #region Funnel by Age Range
+WITH funnel_agg AS (
+   SELECT
+       s.age_range,
+       COUNT(1) AS app_downloads,
+       COUNT(s.user_id) AS signed_up,
+       COUNT(r.user_id) AS requested_ride,
+       SUM(
+           CASE WHEN r.ride_completed = 1
+               THEN 1
+               ELSE 0
+           END
+       ) AS completed_ride,
+       COUNT(rv.user_id) AS review_completed
+   FROM app_downloads a
+   LEFT JOIN signups s ON a.app_download_key = s.session_id
+   LEFT JOIN (
+       SELECT user_id,
+           MAX(
+               CASE WHEN dropoff_ts IS NOT NULL
+                   THEN 1
+                   ELSE 0
+               END
+           ) AS ride_completed
+       FROM ride_requests
+       GROUP BY 1
+   ) r ON s.user_id = r.user_id
+   LEFT JOIN (
+       SELECT DISTINCT user_id
+       FROM reviews
+   ) rv ON r.user_id = rv.user_id
+   GROUP BY 1
+),
+pivot_data AS (
+   SELECT 1 AS funnel_step,
+       'app_download' AS funnel_metric,
+       age_range,
+       app_downloads AS value
+   FROM funnel_agg
+   UNION
+   SELECT 2 AS funnel_step,
+       'sign_up' AS funnel_metric,
+       age_range,
+       signed_up AS value
+   FROM funnel_agg
+   UNION
+   SELECT 3 AS funnel_step,
+       'ride_request' AS funnel_metric,
+       age_range,
+       requested_ride AS value
+   FROM funnel_agg
+   UNION
+   SELECT 4 AS funnel_step,
+       'ride_complete' AS funnel_metric,
+       age_range,
+       completed_ride AS value
+   FROM funnel_agg
+   UNION
+   SELECT 5 AS funnel_step,
+       'review_complete' AS funnel_metric,
+       age_range,
+       review_completed AS value
+   FROM funnel_agg
+)
+SELECT *,
+   value::float /
+   LAG(value) OVER (
+       PARTITION BY age_range
+       ORDER BY funnel_step
+   ) AS step_conversion,
+   value::float /
+   FIRST_VALUE(value) OVER (
+       PARTITION BY age_range
+       ORDER BY funnel_step
+   ) AS overall_conversion
+FROM pivot_data
+ORDER BY 3, 1;
+-- #endregion
+
+-- Funnel by Age Range Result
+The following is the result for the funnel stages by age range:
+
+| funnel_step | funnel_metric   | age_range | value | step_conversion       | overall_conversion   |
+|-------------|-----------------|-----------|-------|-----------------------|----------------------|
+| 1           | app_download    | 18-24     | 1865  | 1                     | 1                    |
+| 2           | sign_up         | 18-24     | 1865  | 1                     | 1                    |
+| 3           | ride_request    | 18-24     | 1300  | 0.6970509383378016    | 0.6970509383378016   |
+| 4           | ride_complete   | 18-24     | 670   | 0.5153846153846153    | 0.35924932975871315  |
+| 5           | review_complete | 18-24     | 473   | 0.7059701492537314    | 0.25361930294906165  |
+| 1           | app_download    | 25-34     | 3447  | 1                     | 1                    |
+| 2           | sign_up         | 25-34     | 3447  | 1                     | 1                    |
+| 3           | ride_request    | 25-34     | 2425  | 0.7035102988105599    | 0.7035102988105599   |
+| 4           | ride_complete   | 25-34     | 1227  | 0.505979381443299     | 0.35596170583115755  |
+| 5           | review_complete | 25-34     | 842   | 0.6862265688671557    | 0.24427038004061502  |
+| 1           | app_download    | 35-44     | 5181  | 1                     | 1                    |
+| 2           | sign_up         | 35-44     | 5181  | 1                     | 1                    |
+| 3           | ride_request    | 35-44     | 3662  | 0.7068133564948852    | 0.7068133564948852   |
+| 4           | ride_complete   | 35-44     | 1861  | 0.508192244675041     | 0.3591970662034356   |
+| 5           | review_complete | 35-44     | 1332  | 0.7157442235357335    | 0.25709322524609146  |
+| 1           | app_download    | 45-54     | 1826  | 1                     | 1                    |
+| 2           | sign_up         | 45-54     | 1826  | 1                     | 1                    |
+| 3           | ride_request    | 45-54     | 1285  | 0.7037239868565169    | 0.7037239868565169   |
+| 4           | ride_complete   | 45-54     | 630   | 0.490272373540856     | 0.34501642935377874  |
+| 5           | review_complete | 
+
+/*
+-- Average Duration and Cost --
+This code calculates the average duration and cost of rides with 'Approved' charge status.
+*/
+
+-- #region Average Duration and Cost
+SELECT
+    AVG(dropoff_ts - pickup_ts) AS avg_duration,
+    AVG(purchase_amount_usd) AS avg_cost
+FROM ride_requests AS r
+LEFT JOIN transactions AS t ON t.ride_id = r.ride_id
+WHERE t.charge_status = 'Approved';
+-- #endregion
+
+-- Average Duration and Cost Result
+The following is the result for the average duration and cost:
+
+| avg_duration    | avg_cost            |
+|-----------------|---------------------|
+| 00:52:36.447881 | 19.995803045694796  |
+
+
+/*
+-- Number of Users Who Requested and Completed Rides --
+This code calculates the number of users who requested rides and the number of users who completed rides.
+*/
+
+-- #region Number of Users Who Requested and Completed Rides
+WITH user_ride_status AS (
+    SELECT user_id,
+        MAX(CASE WHEN dropoff_ts IS NOT NULL THEN 1 ELSE 0 END) AS ride_completed
+    FROM ride_requests
+    GROUP BY user_id
+)
+SELECT
+    COUNT(*) AS number_of_users_who_requested,
+    SUM(ride_completed) AS number_of_users_who_completed
+FROM user_ride_status;
+-- #endregion
+
+-- Number of Users Who Requested and Completed Rides Result
+The following is the result for the number of users who requested and completed rides:
+
+| number_of_users_who_requested | number_of_users_who_completed |
+|-------------------------------|-------------------------------|
+| 12406                         | 6233                          |
+
+
+/*
+-- Downloads by Platform --
+This code calculates the number of downloads by platform and the percentage of downloads for each platform.
+*/
+
+-- #region Downloads by Platform
+SELECT
+    platform,
+    COUNT(*) AS download,
+    SUM(COUNT(*)) OVER() AS total_downloads,
+    CONCAT(
+        CAST(COUNT(*)::float / SUM(COUNT(*)) OVER() * 100 AS numeric(5, 2)),
+        '%'
+    ) AS pct_of_downloads
+FROM app_downloads
+GROUP BY platform;
+-- #endregion
+
+-- Downloads by Platform Result
+The following is the result for the downloads by platform:
+
+| platform | download | total_downloads | pct_of_downloads |
+|----------|----------|-----------------|------------------|
+| ios      | 14290    | 23608           | 60.53%           |
+| web      | 2383     | 23608           | 10.09%           |
+| android  | 6935     | 23608           | 29.38%           |
+
+
+/*
+-- General Funnel --
+This code calculates various metrics for the general funnel. It returns the percentage of previous and percentage of first
+for the first 5 steps. 
+*/
+
+-- #region General Funnel
+WITH funnel_agg AS (
+   SELECT COUNT(1) AS app_downloads,
+       COUNT(s.user_id) AS signed_up,
+       COUNT(r.user_id) AS requested_ride,
+       SUM(
+           CASE WHEN r.ride_completed = 1
+               THEN 1
+               ELSE 0
+           END
+       ) AS completed_ride,
+       COUNT(rv.user_id) AS review_completed
+   FROM app_downloads a
+   LEFT JOIN signups s ON a.app_download_key = s.session_id
+   LEFT JOIN (
+       SELECT user_id,
+           MAX(
+               CASE WHEN dropoff_ts IS NOT NULL
+                   THEN 1
+                   ELSE 0
+               END
+           ) AS ride_completed
+       FROM ride_requests
+       GROUP BY 1
+   ) r ON s.user_id = r.user_id
+   LEFT JOIN (
+       SELECT DISTINCT user_id
+       FROM reviews
+   ) rv ON r.user_id = rv.user_id
+),
+pivot_data AS (
+   SELECT 1 AS funnel_step,
+       'app_download' AS funnel_metric,
+       app_downloads AS value
+   FROM funnel_agg
+   UNION
+   SELECT 2 AS funnel_step,
+       'sign_up' AS funnel_metric,
+       signed_up AS value
+   FROM funnel_agg
+   UNION
+   SELECT 3 AS funnel_step,
+       'ride_request' AS funnel_metric,
+       requested_ride AS value
+   FROM funnel_agg
+   UNION
+   SELECT 4 AS funnel_step,
+       'ride_complete' AS funnel_metric,
+       completed_ride AS value
+   FROM funnel_agg
+   UNION
+   SELECT 5 AS funnel_step,
+       'review_complete' AS funnel_metric,
+       review_completed AS value
+   FROM funnel_agg
+)
+SELECT *,
+   value::float /
+   LAG(value) OVER (
+       ORDER BY funnel_step
+   ) AS step_conversion,
+   value::float /
+   FIRST_VALUE(value) OVER (
+       ORDER BY funnel_step
+   ) AS overall_conversion
+FROM pivot_data
+ORDER BY 1;
+-- #endregion
+
+-- General Funnel Result
+The following is the result for the general funnel:
+
+| funnel_step | funnel_metric   | value | step_conversion       | overall_conversion   |
+|-------------|-----------------|-------|-----------------------|----------------------|
+| 1           | app_download    | 23608 | 1                     | 1                    |
+| 2           | sign_up         | 17623 | 0.7464842426296171    | 0.7464842426296171   |
+| 3           | ride_request    | 12406 | 0.7039664075356069    | 0.5254998305659099   |
+| 4           | ride_complete   | 6233  | 0.5024181847493149    | 0.26402067095899695  |
+| 5           | review_complete | 4348  | 0.6975774105567143    | 0.18417485598102337  |
+
+/*
+-- Wait Time Before Cancel --
+This code calculates the wait time before cancellation for each age range.
+*/
+
+-- #region Wait Time Before Cancel
+SELECT signups.age_range, r.cancel_ts - r.request_ts AS wait_be4_cancel, COUNT(cancel_ts)
+FROM ride_requests r
+LEFT JOIN signups USING (user_id)
+GROUP BY 2, signups.age_range
+ORDER BY 1;
+-- #endregion
+
+-- Wait Time Before Cancel Result
+/*
+This will help investigating the coorelation between age range and wait time before cancellation. if any. Produces 150 rows
+*/
+The following is the result for the wait time before cancel:
+
+| age_range | wait_be4_cancel | count |
+|-----------|-----------------|-------|
+| 18-24     | 00:02:00        | 771   |
+| 18-24     | 00:03:00        | 724   |
+| 18-24     | 00:04:00        | 695   |
+| 18-24     | 00:05:00        | 721   |
+| 18-24     | 00:06:00        | 754   |
+| 18-24     | 00:07:00        | 769   |
+| 18-24     | 00:08:00        | 760   |
+| 18-24     | 00:09:00        | 697   |
+| 18-24     | 00:10:00        | 727   |
+| 18-24     | 00:11:00        | 728   |
+| 18-24     | 00:12:00        | 749   |
+| 18-24     | 00:13:00        | 818   |
+| 18-24     | 00:14:00        | 803   |
+| 18-24     | 00:15:00        | 793   |
+| 18-24     | 00:16:00        | 846   |
+| 18-24     | 00:17:00        | 905   |
+| 18-24     | 00:18:00        | 960   |
+| 18-24     | 00:19:00        | 999   |
+| 18-24     | 00:20:00        | 964   |
+| 18-24     | 00:21:00        | 216   |
+| 18-24     | 00:22:00        | 211   |
+| 18-24     | 00:23:00        | 239   |
+| 18-24     | 00:24:00        | 176   |
+| 18-24     | 00:25:00        | 174   |
+| 18-24     | 00:26:00        | 129   |
+| 18-24     | 00:27:00        | 108   |
+| 18-24     | 00:28:00        | 69    |
+| 18-24     | 00:29:00        | 47    |
+| 18-24     | 00:30:00        | 22    |
+| 18-24     | 0               | 0     |
+| 25-34     | 00:02:00        | 1383  |
+| 25-34     | 00:03:00        | 1391  |
+| 25-34     | 00:04:00        | 1377  |
+| 25-34     | 00:05:00        | 1402  |
+| 25-34     | 00:06:00        | 1407  |
+| 25-34     | 00:07:00        | 1393  |
+| 25-34     | 00:08:00        | 1323  |
+| 25-34     | 00:09:00        | 1363  |
+| 25-34     | 00:10:00        | 1417  |
+| 25-34     | 00:11:00        | 1356  |
+| 25-34     | 00:12:00        | 1482  |
+| 25-34     | 00:13:00        | 1478  |
+| 25-34     | 00:14:00        | 1522  |
+| 25-34     | 00:15:00        | 1570  |
+| 25-34     | 00:16:00        | 1673  |
+| 25-34     | 00:17:00        | 1642  |
+| 25-34     | 00:18:00        | 1767  |
+| 25-34     | 00:19:00        | 1721  |
+| 25-34     | 00:20:00        | 1817  |
+| 25-34     | 00:21:00        | 443   |
+| 25-34     | 00:22:00        | 443   |
+| 25-34     | 00:23:00        | 414   |
+| 25-34     | 00:24:00        | 368   |
+| 25-34     | 00:25:00        | 269   |
+| 25-34     | 00:26:00        | 237   |
+| 25-34     | 00:27:00        | 177   |
+| 25-34     | 00:28:00        | 142   |
+| 25-34     | 00:29:00        | 87    |
+| 25-34     | 00:30:00        | 51    |
+| 25-34     | 0               | 0     |
+| 35-44     | 00:02:00        | 2100  |
+| 35-44     | 00:03:00        | 2084  |
+| 35-44     | 00:04:00        | 2160  |
+| 35-44     | 00:05:00        | 2074  |
+| 35-44     | 00:06:00        | 2112  |
+| 35-44     | 00:07:00        | 2072  |
+| 35-44     | 00:08:00        | 2087  |
+| 35-44     | 00:09:00        | 2155  |
+| 35-44     | 00:10:00        | 2110  |
+| 35-44     | 00:11:00        | 2120  |
+| 35-44     | 00:12:00        | 2263  |
+| 35-44     | 00:13:00        | 2273  |
+| 35-44     | 00:14:00        | 2357  |
+| 35-44     | 00:15:00        | 2370  |
+| 35-44     | 00:16:00        | 2421  |
+| 35-44     | 00:17:00        | 2546  |
+| 35-44     | 00:18:00        | 2610  |
+| 35-44     | 00:19:00        | 2675  |
+| 35-44     | 00:20:00        | 2763  |
+| 35-44     | 00:21:00        | 702   |
+| 35-44     | 00:22:00        | 656   |
+| 35-44     | 00:23:00        | 605   |
+| 35-44     | 00:24:00        | 498   |
+| 35-44     | 00:25:00        | 463   |
+| 35-44     | 00:26:00        | 351   |
+| 35-44     | 00:27:00        | 276   |
+| 35-44     | 00:28:00        | 233   |
+| 35-44     | 00:29:00        | 139   |
+| 35-44     | 00:30:00        | 81    |
+| 35-44     | 0               | 0     |
+| 45-54     | 00:02:00        | 747   |
+| 45-54     | 00:03:00        | 745   |
+| 45-54     | 00:04:00        | 743   |
+| 45-54     | 00:05:00        | 751   |
+| 45-54     | 00:06:00        | 755   |
+| 45-54     | 00:07:00        | 788   |
+| 45-54     | 00:08:00        | 755   |
+| 45-54     | 00:09:00        | 721   |
+| 45-54     | 00:10:00        | 714   |
+| 45-54     | 00:11:00        | 738   |
+| 45-54     | 00:12:00        | 796   |
+| 45-54     | 00:13:00        | 817   |
+| 45-54     | 00:14:00        | 845   |
+| 45-54     | 00:15:00        | 927   |
+| 45-54     | 00:16:00        | 890   |
+| 45-54     | 00:17:00        | 921   |
+| 45-54     | 00:18:00        | 971   |
+| 45-54     | 00:19:00        | 1025  |
+| 45-54     | 00:20:00        | 1003  |
+| 45-54     | 00:21:00        | 247   |
+| 45-54     | 00:22:00        | 218   |
+| 45-54     | 00:23:00        | 182   |
+| 45-54     | 00:24:00        | 171   |
+| 45-54     | 00:25:00        | 139   |
+| 45-54     | 00:26:00        | 138   |
+| 45-54     | 00:27:00        | 109   |
+| 45-54     | 00:28:00        | 77    |
+| 45-54     | 00:29:00        | 50    |
+| 45-54     | 00:30:00        | 25    |
+| 45-54     | 0               | 0     |
+|           | 00:02:00        | 2064  |
+|           | 00:03:00        | 2222  |
+|           | 00:04:00        | 2192  |
+|           | 00:05:00        | 2224  |
+|           | 00:06:00        | 2243  |
+|           | 00:07:00        | 2149  |
+|           | 00:08:00        | 2222  |
+|           | 00:09:00        | 2270  |
+|           | 00:10:00        | 2229  |
+|           | 00:11:00        | 2238  |
+|           | 00:12:00        | 2383  |
+|           | 00:13:00        | 2338  |
+|           | 00:14:00        | 2489  |
+|           | 00:15:00        | 2499  |
+|           | 00:16:00        | 2567  |
+|           | 00:17:00        | 2718  |
+|           | 00:18:00        | 2862  |
+|           | 00:19:00        | 2804  |
+|           | 00:20:00        | 2963  |
+|           | 00:21:00        | 712   |
+|           | 00:22:00        | 667   |
+|           | 00:23:00        | 599   |
+|           | 00:24:00        | 521   |
+|           | 00:25:00        | 479   |
+|           | 00:26:00        | 357   |
+|           | 00:27:00        | 304   |
+|           | 00:28:00        | 228   |
+|           | 00:29:00        | 145   |
+|           | 00:30:00        | 84    |
+|           | 0               | 0     |
